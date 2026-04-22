@@ -1,0 +1,114 @@
+version: "3.9"
+
+services:
+
+  # ─── MySQL ────────────────────────────────────────────────
+  db:
+    image: mysql:8.0
+    container_name: workflow_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: workflow_orchestrator
+      MYSQL_USER: workflow
+      MYSQL_PASSWORD: secret
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uworkflow", "-psecret"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Backend (Laravel 11 / PHP 8.2) ──────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: workflow_backend
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - ./backend:/var/www
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      DB_CONNECTION: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_DATABASE: workflow_orchestrator
+      DB_USERNAME: workflow
+      DB_PASSWORD: secret
+      QUEUE_CONNECTION: database
+      JWT_SECRET: ${JWT_SECRET:-changeme_run_php_artisan_jwt_secret}
+      FIREBASE_DATABASE_URL: ${FIREBASE_DATABASE_URL:-}
+      FIREBASE_DATABASE_SECRET: ${FIREBASE_DATABASE_SECRET:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "
+        composer install --no-interaction --prefer-dist &&
+        php artisan key:generate --force &&
+        php artisan jwt:secret --force &&
+        php artisan migrate --force --seed &&
+        php artisan serve --host=0.0.0.0 --port=8000
+      "
+
+  # ─── Queue Worker ─────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: workflow_worker
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - ./backend:/var/www
+    environment:
+      APP_ENV: local
+      DB_CONNECTION: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_DATABASE: workflow_orchestrator
+      DB_USERNAME: workflow
+      DB_PASSWORD: secret
+      QUEUE_CONNECTION: database
+      JWT_SECRET: ${JWT_SECRET:-changeme_run_php_artisan_jwt_secret}
+      FIREBASE_DATABASE_URL: ${FIREBASE_DATABASE_URL:-}
+      FIREBASE_DATABASE_SECRET: ${FIREBASE_DATABASE_SECRET:-}
+    depends_on:
+      - backend
+    command: >
+      sh -c "
+        sleep 15 &&
+        php artisan queue:work --queue=orchestration,steps,notifications,compensations,default --tries=3 --backoff=5 --timeout=60
+      "
+
+  # ─── Frontend (Vue 3 / Node 22) ───────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: workflow_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api
+      VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+      VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+      VITE_FIREBASE_DATABASE_URL: ${VITE_FIREBASE_DATABASE_URL:-}
+      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+      VITE_FIREBASE_STORAGE_BUCKET: ${VITE_FIREBASE_STORAGE_BUCKET:-}
+      VITE_FIREBASE_MESSAGING_SENDER_ID: ${VITE_FIREBASE_MESSAGING_SENDER_ID:-}
+      VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
+    depends_on:
+      - backend
+
+volumes:
+  db_data:
